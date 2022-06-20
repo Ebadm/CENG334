@@ -52,6 +52,9 @@ int getNextCluster(){
 
 void setFATnext(int prevFAT, int newFAT){
 
+    if(prevFAT == 0){
+        prevFAT = 2;
+    }
     int FATblock_offset = (BPB.BytesPerSector * BPB.ReservedSectorCount) + (prevFAT * 4);
     fseek(disk, FATblock_offset, SEEK_SET);
     fread(&FATentry, sizeof(int), 1, disk);
@@ -112,10 +115,8 @@ void changetoString( uint16_t* ucs2,int ucs2len, char *tmp)
 }
 
 void init_BPB(){
-
     fseek(disk,0,SEEK_SET);
     fread(&BPB, sizeof(BPB_struct), 1, disk); 
-    //printf("%d %d %d %d %d %d\n", BPB.BytesPerSector,BPB.SectorsPerCluster , BPB.ReservedSectorCount, BPB.NumFATs, BPB.RootEntryCount, BPB.extended.FATSize);
 }
 
 void print_entries(vector<string> entries){
@@ -135,7 +136,7 @@ void print_entries_nline(vector<string> entries){
     }
 }
 
-vector<int> gotoCluster(char *dirname)
+vector<int> gotoCluster(char *dirname, bool isFile, bool isFolder)
 {
     vector<int> result;
     bool found = 1;
@@ -145,16 +146,18 @@ vector<int> gotoCluster(char *dirname)
     char * tmp = (char *)malloc(20);
     char * fullName;
     int offset = LBAToOffset(current_cluster);
-    //printf("%d \n", offset);
     fseek(disk, offset, SEEK_SET);  
     fread(&dir, 32, 1, disk);   //read an entry
     int offset_count = 0;
     int init_cluster = current_cluster;
     int file_count = 0;
+    int starting_lfn_offset = -1;
+    int pcluster = current_cluster;
+
 
     while(true){
         if (offset_count >= BPB.BytesPerSector*BPB.SectorsPerCluster){
-            int pcluster = current_cluster;
+            pcluster = current_cluster;
             current_cluster = getNextCluster();
             if (current_cluster == -1){
                 current_cluster = pcluster;
@@ -169,6 +172,7 @@ vector<int> gotoCluster(char *dirname)
         }
         if (dir.lfn.sequence_number == 0xE5){
             fread(&dir, 32, 1, disk);
+            offset_count += 32;
             entries_count++;
             continue;
         }
@@ -177,6 +181,9 @@ vector<int> gotoCluster(char *dirname)
             break;
         }
         if(dir.lfn.attributes == 0x0f && dir.lfn.reserved == 0x00){ //LFN
+
+            starting_lfn_offset = starting_lfn_offset == -1 ? offset_count : starting_lfn_offset;
+
             changetoString( dir.lfn.name1 , sizeof(dir.lfn.name1)/2 , tmp);
             lfnName += string(tmp,strlen(tmp));
             changetoString( dir.lfn.name2 , sizeof(dir.lfn.name2)/2 , tmp);
@@ -199,12 +206,34 @@ vector<int> gotoCluster(char *dirname)
             totalName  += string((char *)dir.msdos.extension);
             string token = totalName .substr(0, totalName.find('~'));
 
-            if (!strcmp(token.c_str(), dirname) && dir.msdos.attributes == 0x10){ //Found Directory to CD into
+            if (isFolder && isFile && !strcmp(token.c_str(), dirname)){         //Found file/folder to move
+                result.push_back(found);
+                result.push_back(current_cluster);
+                result.push_back(offset_count);
+                result.push_back(starting_lfn_offset);
+                result.push_back(pcluster);
+
+                current_cluster = init_cluster;
+
+                return result;
+            }
+
+            else if (isFolder && !strcmp(token.c_str(), dirname) && dir.msdos.attributes == 0x10){ //Found Directory to CD into
                 current_cluster = (dir.msdos.eaIndex << 2) + dir.msdos.firstCluster;
                 result.push_back(found);
+                result.push_back(current_cluster);
+                result.push_back(offset_count);
+                result.push_back(file_count);
+                return result;
+            }
+            else if (isFile && !strcmp(token.c_str(), dirname) && dir.msdos.attributes == 0x20){  //Found file to show contents of
+                current_cluster = (dir.msdos.eaIndex << 2) + dir.msdos.firstCluster;
+                result.push_back(found);
+                result.push_back(dir.msdos.fileSize);
                 return result;
             }
             totalName.clear(); 
+            starting_lfn_offset = -1;
         }
  
         totalName  = lfnName + totalName;
@@ -251,28 +280,35 @@ void ChangeDirectory(char* path){
         return;
     }
 
+    if (path[0] == '/') //remove preceding /
+        path++;
+
+
     int prevtokencluster;
     prev_cluster = current_cluster;
     prev_cmd = currDirectoryStr;
     bool reset = false;
-
     char * token = strtok(path, "/");
+    
     //Check if it is relative or absolute path
     if (token != NULL && current_cluster){
-        current_cluster = 0;
-        gotoCluster(token);
-        if (current_cluster == 0){      //Not absolute path
-            current_cluster = prev_cluster;
+        //current_cluster = 0;
+        gotoCluster(token,0,1);
+        if (current_cluster == prev_cluster){      //Not relative path
+            gotoRoot(); 
         }
         else{
-            gotoRoot();                 //Absolute Path
+               //Absolute Path
+            current_cluster = prev_cluster;
         }
     }
 
+    int word_count = 0;
     // loop through the string to extract all other tokens
     while( token != NULL ) {
         prevtokencluster = current_cluster;
-        gotoCluster(token);
+        gotoCluster(token,0,1);
+
         if (current_cluster == prevtokencluster && strcmp(".", token)){
             reset = true;
             break;
@@ -282,6 +318,9 @@ void ChangeDirectory(char* path){
         if (prevtokencluster != current_cluster)
             update_cmd(token);
         token = strtok(NULL, "/");
+        if ( token && token[strlen(token)-1] == '!'){
+            token[strlen(token)-1] = '\0';
+        }
     }
     if (reset == true){
         current_cluster = prev_cluster;
@@ -341,6 +380,7 @@ vector<string> traverse_directory(parsed_input* input, bool isDetails)
         if (dir.lfn.sequence_number == 0xE5){
             fread(&dir, 32, 1, disk);
             entries_count++;
+            offset_count+=32;
             continue;
         }
         if (dir.lfn.sequence_number == 0x00){
@@ -387,11 +427,16 @@ vector<string> traverse_directory(parsed_input* input, bool isDetails)
 
 void ShowContents(parsed_input* input){
 
+
     if (!input->arg1 || strcmp("-l", input->arg1)){      //no -l argument
         if (input->arg1){
             prev_cluster = current_cluster;
             prev_cmd = currDirectoryStr;
             ChangeDirectory(input->arg1);
+            if (current_cluster == prev_cluster){
+                prev_cmd = currDirectoryStr;
+                return;
+            }
         }
         vector<string> dir_entries = traverse_directory(input,false);
         print_entries(dir_entries);
@@ -405,6 +450,10 @@ void ShowContents(parsed_input* input){
             prev_cluster = current_cluster;
             prev_cmd = currDirectoryStr;
             ChangeDirectory(input->arg2);
+            if (current_cluster == prev_cluster){
+                prev_cmd = currDirectoryStr;
+                return;
+            }
         }
         vector<string> dir_entries = traverse_directory(input,true);
         print_entries_nline(dir_entries);
@@ -476,9 +525,7 @@ vector<FatFileEntry>createLFNEntries(string fileName, unsigned char checksum){
     return res;
 }
 
-unsigned char init_ShortEntry(FatFile83 & sf, int indexnum, bool dot, bool dotdot, int dorddclust){
-
-
+unsigned char init_ShortEntry(FatFile83 & sf, int indexnum, bool dot, bool dotdot, int dorddclust, bool isFile){
 
     for (int i=0; i < 8;i++){
         sf.filename[i] = 0x20;
@@ -505,26 +552,33 @@ unsigned char init_ShortEntry(FatFile83 & sf, int indexnum, bool dot, bool dotdo
             character.pop_back();
             i++;        
         }
-
-        int cluster = getEmptyCluster();
-        cout << "FREE CLUSTER AT : " << cluster << endl;
-        sf.eaIndex = cluster >> 16;
-        sf.firstCluster = cluster;
+        if (isFile){
+            sf.eaIndex = 0;
+            sf.firstCluster = 0;
+            sf.attributes = 0x20;
+        }
+        else{
+            int cluster = getEmptyCluster();
+            //cout << "FREE CLUSTER AT : " << cluster << endl;
+            sf.eaIndex = cluster >> 16;
+            sf.firstCluster = cluster;
+            sf.attributes = 0x10;
+        }
     }
     else if (dot){
         sf.filename[0] = '.';
         sf.eaIndex = dorddclust >> 16;
         sf.firstCluster = dorddclust;
-
+        sf.attributes = 0x10;
     }
     else if (dotdot){
         sf.filename[0] = '.';
         sf.filename[1] = '.';
         sf.eaIndex = dorddclust >> 16;
         sf.firstCluster = dorddclust;
+        sf.attributes = 0x10;
     }
 
-    sf.attributes = 0x10;
     sf.reserved =  0x00;
     sf.creationTimeMs = 0x00;
     sf.fileSize = 0x00000000;
@@ -555,16 +609,17 @@ void write_directoryentry(vector<FatFileEntry>& entries, int appendOffset){
     while(!entries.empty()){
         offset = LBAToOffset(current_cluster);
         fseek(disk, offset+appendOffset, SEEK_SET);
-        cout << "Directory writing init offset: " << offset+appendOffset << endl;
+        //cout << "Directory writing init offset: " << offset+appendOffset << endl;
         while(appendOffset < BPB.BytesPerSector*BPB.SectorsPerCluster && !entries.empty()){
             val = entries.back();
             fwrite(&val, 32, 1, disk);
             entries.pop_back();
-            cout << "wrote entry on : " << appendOffset << " of cluster " << current_cluster << endl;
+            //cout << "wrote entry on : " << appendOffset << " of cluster " << current_cluster << endl;
             appendOffset = appendOffset + 32;
         }
         if (!entries.empty()){
             new_cluster = getEmptyCluster();
+            //cout << "GOT CLUSTER NEW " << new_cluster << " " << current_cluster << endl;
             setFATnext(current_cluster,new_cluster);
             current_cluster = new_cluster;
             appendOffset = 0;
@@ -583,11 +638,9 @@ void MakeDirectory(parsed_input* input){
     bool isPath, found;
     int appendCluster, appendOffset, indexNum;
     vector<int> res;
-    int offset_free;
     unsigned char checksum;
     string path(input->arg1);
     isPath = path.find('/') == -1 ? false : true;
-    char * tmp2 = (char *)malloc(20);
 
     prev_cluster = current_cluster;
     prev_cmd = currDirectoryStr;
@@ -596,35 +649,30 @@ void MakeDirectory(parsed_input* input){
         string gotoPath = path.substr(0,path.find_last_of('/'));
         char char_path[gotoPath.length() + 1];
         strcpy(char_path, gotoPath.c_str());
-        cout << char_path << endl;
         ChangeDirectory(char_path);
-        cout << current_cluster << endl;
     }
 
     path = path.substr(path.find_last_of('/')+1,path.length());
     char foldername[path.length() + 1];
     strcpy(foldername, path.c_str());
-    res = gotoCluster(foldername);
+    res = gotoCluster(foldername,0,1);
     found = res.at(0);
-    cout << "FOUND == " << found << endl;
+    //cout << "FOUND == " << found << endl;
     if (!found){    //if file not found
         appendCluster = res.at(1); appendOffset = res.at(2); indexNum = 1 + res.at(3);
-        cout << appendCluster << "->" << appendOffset << " " << indexNum << endl;
-        checksum = init_ShortEntry(sf.msdos, indexNum, 0 , 0, 0);
+        //cout << appendCluster << "->" << appendOffset << " " << indexNum << endl;
+        checksum = init_ShortEntry(sf.msdos, indexNum, 0 , 0, 0,0);
         entries = createLFNEntries(path,checksum);
         entries.insert(entries.begin(), sf);      //Add short entry to the beginning
         int preceding_cluster = current_cluster;
         current_cluster = sf.msdos.eaIndex << 16 | sf.msdos.firstCluster;
-        init_ShortEntry(dot, 0, 1, 0, current_cluster);
+        init_ShortEntry(dot, 0, 1, 0, current_cluster,0);
         int offset = LBAToOffset(current_cluster);
-        cout << "OFFSET FOR DOTL " << offset << endl;
+        //cout << "OFFSET FOR DOTL " << offset << endl;
         fseek(disk, offset, SEEK_SET);
         fwrite(&dot, 32, 1, disk);
-        init_ShortEntry(dotdot, 0, 0,1, preceding_cluster);
+        init_ShortEntry(dotdot, 0, 0,1, preceding_cluster,0);
         fwrite(&dotdot, 32, 1, disk);
-        if (appendCluster != -1){
-            current_cluster = appendCluster;
-        }
         current_cluster = appendCluster;
         write_directoryentry(entries,appendOffset);
     }
@@ -635,7 +683,231 @@ void MakeDirectory(parsed_input* input){
 }
 
 
+void MakeFile(parsed_input* input){
 
+    vector<FatFileEntry> entries;
+    FatFileEntry sf;
+    FatFile83 dot;
+    FatFile83 dotdot;
+    bool isPath, found;
+    int appendCluster, appendOffset, indexNum;
+    vector<int> res;
+    unsigned char checksum;
+    string path(input->arg1);
+    isPath = path.find('/') == -1 ? false : true;
+
+    prev_cluster = current_cluster;
+    prev_cmd = currDirectoryStr;
+    if(isPath){
+        string gotoPath = path.substr(0,path.find_last_of('/'));
+        char char_path[gotoPath.length() + 1];
+        strcpy(char_path, gotoPath.c_str());
+        ChangeDirectory(char_path);
+    }
+
+    path = path.substr(path.find_last_of('/')+1,path.length());
+    char filename[path.length() + 1];
+    strcpy(filename, path.c_str());
+    res = gotoCluster(filename,1,0);
+    found = res.at(0);
+    //cout << "FOUND == " << found << endl;
+    if (!found){    //if file not found
+        appendCluster = res.at(1); appendOffset = res.at(2); indexNum = 1 + res.at(3);
+        //cout << appendCluster << "->" << appendOffset << " " << indexNum << endl;
+        checksum = init_ShortEntry(sf.msdos, indexNum, 0 , 0, 0, 1); //FIX
+        entries = createLFNEntries(path,checksum);
+        entries.insert(entries.begin(), sf);      //Add short entry to the beginning
+       
+        current_cluster = appendCluster;
+        write_directoryentry(entries,appendOffset);
+    }
+
+    current_cluster = prev_cluster;
+    currDirectoryStr = prev_cmd;
+
+}
+
+
+void displayContent(parsed_input* input){
+
+
+    bool isPath, found;
+    vector<int> res;
+    string path(input->arg1);
+    isPath = path.find('/') == -1 ? false : true;
+    int fileSize, offset;
+    string FullContents;
+    int bytesPerCluster = (BPB.BytesPerSector*BPB.SectorsPerCluster);
+    prev_cluster = current_cluster;
+    prev_cmd = currDirectoryStr;
+
+    if(isPath){
+        string gotoPath = path.substr(0,path.find_last_of('/'));
+        char char_path[gotoPath.length() + 1];
+        strcpy(char_path, gotoPath.c_str());
+        ChangeDirectory(char_path);
+    }
+
+    path = path.substr(path.find_last_of('/')+1,path.length());
+    char filename[path.length() + 1];
+    strcpy(filename, path.c_str());
+    res = gotoCluster(filename,1,0);
+    found = res.at(0);
+    //cout << "FOUND == " << found << endl;
+    if (found && current_cluster != 0){    //if the file is found and it is not empty
+        fileSize = res.at(1);
+        if (fileSize != 0){
+            FullContents.resize(fileSize);
+            while(true){
+                string contents;
+                contents.resize(bytesPerCluster);
+                offset = LBAToOffset(current_cluster);
+                fseek(disk, offset, SEEK_SET);
+                //cout << "OFFSET FOR DOTL " << offset << endl;
+                if (fileSize < bytesPerCluster){
+                    fread(&contents[0], sizeof(char), fileSize, disk);
+                    FullContents = FullContents + contents;
+                    break;
+                }
+                else{
+                    fread(&contents[0], sizeof(char), bytesPerCluster,disk);
+                    fileSize = fileSize - bytesPerCluster;
+                    FullContents = FullContents + contents;
+                    current_cluster = getNextCluster();
+                    if (current_cluster == -1){
+                        break;
+                    }
+                }
+            }
+            cout << FullContents << endl;   //Print Whole File Contents
+        }
+    }
+
+    current_cluster = prev_cluster;
+    currDirectoryStr = prev_cmd;
+
+}
+
+
+
+vector<FatFileEntry> SavenDelete(int appendCluster, int appendOffset, int LFNoffset, int pcluster){
+
+
+    vector<FatFileEntry> entries;
+    FatFileEntry temp;
+    int size;
+    int bytesPerCluster = (BPB.BytesPerSector*BPB.SectorsPerCluster);
+    if (appendOffset < LFNoffset){ //cluster change
+        int offset = LBAToOffset(pcluster) + LFNoffset;
+        fseek(disk, offset, SEEK_SET);
+        while(offset < (LBAToOffset(pcluster) + bytesPerCluster)){       //save & Delete prev entries
+            //cout << "DELETE FROM1 " << offset << endl;
+            fseek(disk, offset, SEEK_SET);
+            fread(&temp, 32, 1, disk);
+            fseek(disk, offset, SEEK_SET);
+            uint8_t seq_number = 0xE5;
+            fwrite(&seq_number,1,1,disk);
+            fseek(disk, -1, SEEK_CUR);
+            entries.insert(entries.begin(), temp);
+            offset +=32;
+        }
+        LFNoffset = 0;
+    }
+
+    if (appendOffset > LFNoffset){
+
+        size = appendOffset - LFNoffset + 32;
+        int offset = LBAToOffset(appendCluster) + LFNoffset;
+        int finaloffset = LBAToOffset(appendCluster) + appendOffset;
+        fseek(disk, offset, SEEK_SET);
+
+        while(offset < finaloffset + 32){       //save & Delete prev entries
+            //cout << "DELETE FROM " << offset << endl;
+            fseek(disk, offset, SEEK_SET);
+            fread(&temp, 32, 1, disk);
+            fseek(disk, offset, SEEK_SET);
+            uint8_t seq_number = 0xE5;
+            fwrite(&seq_number,1,1,disk);
+            fseek(disk, -1, SEEK_CUR);
+            entries.insert(entries.begin(), temp);
+            offset +=32;
+        }
+
+    }
+
+    return entries;
+}
+
+
+
+void moveEntry(parsed_input* input){
+
+    if (!input->arg1 || !input->arg2){
+        return;
+    }
+
+    vector<FatFileEntry> entries;
+    FatFileEntry temp;
+    bool isSrcPath, isDestPath, foundDest, foundSrc;
+    int appendCluster, appendOffset, LFNoffset, size, pcluster;
+    int DestCluster, DestOffset;
+    vector<int> res, DestRes;
+    string path(input->arg1);
+    string dest(input->arg2);
+    
+    isSrcPath = path.find('/') == -1 ? false : true;
+
+    prev_cluster = current_cluster;
+    prev_cmd = currDirectoryStr;
+
+
+    isDestPath = dest.find('/') == -1 ? false : true;
+    if(isDestPath){
+        string gotoPath = dest.substr(0,dest.find_last_of('/'));
+        char char_path[gotoPath.length() + 1];
+        strcpy(char_path, gotoPath.c_str());
+        ChangeDirectory(char_path);
+    }
+    dest = dest.substr(dest.find_last_of('/')+1,dest.length());
+    char foldernameDest[dest.length() + 1];
+    strcpy(foldernameDest, dest.c_str());
+    DestRes = gotoCluster(foldernameDest,0,1);
+    foundDest = DestRes.at(0); DestCluster = DestRes.at(1);
+    //cout << "FOUND DESt == " << foundDest  << endl;
+    strcpy(foldernameDest, "/");
+    DestRes = gotoCluster(foldernameDest,1,1);
+    DestOffset = DestRes.at(2);
+
+    current_cluster = prev_cluster;
+    currDirectoryStr = prev_cmd;
+
+    if(isSrcPath){
+        string gotoPath = path.substr(0,path.find_last_of('/'));
+        char char_path[gotoPath.length() + 1];
+        strcpy(char_path, gotoPath.c_str());
+        ChangeDirectory(char_path);
+    }
+    path = path.substr(path.find_last_of('/')+1,path.length());
+    char foldername[path.length() + 1];
+    strcpy(foldername, path.c_str());
+
+
+    res = gotoCluster(foldername,1,1);
+    foundSrc = res.at(0);
+    //cout << "FOUND SRC == " << foundSrc << endl;
+    if (foundSrc && foundDest){
+        appendCluster = res.at(1); appendOffset = res.at(2); LFNoffset = res.at(3); pcluster = res.at(4);
+        //cout << appendCluster << "->" << appendOffset << " " << LFNoffset << endl;
+
+        entries = SavenDelete(appendCluster,appendOffset,LFNoffset,pcluster);
+
+        current_cluster = DestCluster;
+        write_directoryentry(entries,DestOffset);
+    }
+
+    current_cluster = prev_cluster;
+    currDirectoryStr = prev_cmd;
+}
 
 void execute(parsed_input* input){
 
@@ -648,17 +920,21 @@ void execute(parsed_input* input){
     else if (input->type == MKDIR){
         MakeDirectory(input);
     } 
-
-
+    else if (input->type == TOUCH){
+        MakeFile(input);
+    } 
+    else if (input->type == CAT){
+        displayContent(input);
+    } 
+    else if (input->type == MV){
+        moveEntry(input);
+    } 
 
 }
 
 
-
-
 int main(int argc, char** argv){
 
-    printf("ARGUMENTS: %d %s\n", argc, argv[1]);
     if (argc < 2) {
         printf("Error, Provide Image file");
         return -1;
